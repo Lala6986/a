@@ -33,7 +33,6 @@ public class PaintDbgSetActive
             bool has = dict != null && dict.ContainsKey(type);
             bool val = has && dict[type];
             Plugin.Log.LogInfo($"[PaintDbg] SetActiveBodyPaint type={(int)type} active={isActive} dictHas={has} dictVal={val}");
-            PaintManager.DumpPaintState($"after SetActive {(int)type}");
         }
         catch (Exception ex) { Plugin.Log.LogWarning($"[PaintDbg] SetActive postfix: {ex.Message}"); }
     }
@@ -87,7 +86,6 @@ public class PaintDbgApply
         try
         {
             Plugin.Log.LogInfo("[PaintDbg] ApplyFromGameState <<");
-            PaintManager.DumpPaintState("apply");
         }
         catch { }
     }

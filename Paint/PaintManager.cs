@@ -9,7 +9,6 @@ using ExposureUnnoticed2.Object3D.Player.Scripts;
 using ExposureUnnoticed2.ObjectUI.ClosetMenu.CustomizeMenu;
 using ExposureUnnoticed2.Scripts.InGame;
 using HarmonyLib;
-using MyFirstPlugin.Hair;
 using UnityEngine;
 
 namespace MyFirstPlugin.Paint;
@@ -21,11 +20,15 @@ public class PaintAsset
     public BodyPaintType BaseType;
     public Texture2D Texture;
     public Material Material;
+
+    /// <summary>True when this entry comes from effect.json — handled by EffectManager, not PaintManager.</summary>
+    public bool IsEffect;
 }
 
 /// <summary>
 /// Custom body paints ("tattoos"). Everything lives in
-/// BepInEx/plugins/MyFirstPlugin/CustomPaints/&lt;folder&gt;/paint.json (+ optional texture).
+/// BepInEx/plugins/MyFirstPlugin/CustomPaints/&lt;folder&gt;/paint.json (+ optional texture)
+/// or effect.json (material-property modifier, see EffectManager).
 /// </summary>
 public static class PaintManager
 {
@@ -74,6 +77,7 @@ public static class PaintManager
         foreach (string dir in Directory.GetDirectories(root))
         {
             string jsonPath = Path.Combine(dir, "paint.json");
+            if (!File.Exists(jsonPath)) jsonPath = Path.Combine(dir, "effect.json");
             if (!File.Exists(jsonPath)) continue;
 
             try
@@ -84,6 +88,8 @@ public static class PaintManager
 
                 if (manifest == null) continue;
 
+                bool isEffect = string.Equals(manifest.type, "effect", StringComparison.OrdinalIgnoreCase);
+
                 if (manifest.id < CustomIdStart)
                 {
                     manifest.id = NextAvailableId();
@@ -92,7 +98,7 @@ public static class PaintManager
 
                 if (Bank.ContainsKey(manifest.id))
                 {
-                    Plugin.Log.LogError($"[Paint] Duplicate paint ID {manifest.id} in {dir}");
+                    Plugin.Log.LogError($"[Paint] Duplicate id {manifest.id} in {dir}");
                     continue;
                 }
 
@@ -100,22 +106,27 @@ public static class PaintManager
                 {
                     Id = manifest.id,
                     Manifest = manifest,
-                    BaseType = ParseBaseType(manifest.baseType),
+                    BaseType = isEffect ? BodyPaintType.TattooDark : ParseBaseType(manifest.baseType),
+                    IsEffect = isEffect,
                 };
 
-                if (!string.IsNullOrWhiteSpace(manifest.texture))
+                if (!isEffect && !string.IsNullOrWhiteSpace(manifest.texture))
                 {
                     string texPath = Path.Combine(dir, manifest.texture);
-                    if (File.Exists(texPath))
-                        asset.Texture = LoadTexture(texPath);
-                    else
-                        Plugin.Log.LogWarning($"[Paint] Missing texture '{texPath}'");
+                    if (File.Exists(texPath)) asset.Texture = LoadTexture(texPath);
+                    else Plugin.Log.LogWarning($"[Paint] Missing texture '{texPath}'");
                 }
+
+                if (isEffect && (manifest.targets == null || manifest.targets.Length == 0))
+                    Plugin.Log.LogWarning($"[Paint] Effect '{manifest.name}' has no targets — will not apply.");
 
                 Bank[manifest.id] = asset;
                 Plugin.Log.LogInfo(
-                    $"[Paint] Loaded '{manifest.name}' id={manifest.id} base={asset.BaseType}" +
-                    $" tex={(asset.Texture != null ? $"{asset.Texture.width}x{asset.Texture.height}" : "none")}");
+                    $"[Paint] Loaded {(isEffect ? "effect" : "paint")} '{manifest.name}' id={manifest.id}" +
+                    (isEffect
+                        ? $" targets=[{string.Join(",", manifest.targets ?? Array.Empty<string>())}]"
+                        : $" base={asset.BaseType}" +
+                          $" tex={(asset.Texture != null ? $"{asset.Texture.width}x{asset.Texture.height}" : "none")}"));
             }
             catch (Exception ex)
             {
@@ -123,7 +134,7 @@ public static class PaintManager
             }
         }
 
-        Plugin.Log.LogInfo($"[Paint] Scan complete. {Bank.Count} custom paint(s).");
+        Plugin.Log.LogInfo($"[Paint] Scan complete. {Bank.Count} custom entr{(Bank.Count == 1 ? "y" : "ies")}.");
     }
 
     private static BodyPaintType ParseBaseType(string s)
@@ -164,8 +175,7 @@ public static class PaintManager
         tex.name = Path.GetFileNameWithoutExtension(path);
         tex.wrapMode = TextureWrapMode.Clamp;
 
-        // ═══ THE CRITICAL FIX ═══
-        // Stop Unity's Garbage Collector from destroying our texture!
+        // ═══ Stop Unity's GC from destroying our texture ═══
         tex.hideFlags = HideFlags.DontUnloadUnusedAsset;
 
         return tex;
@@ -197,7 +207,6 @@ public static class PaintManager
                 rec._TypeId_k__BackingField = asset.Id;
 
                 dict.Add(type, rec);
-                Plugin.Log.LogInfo($"[Paint] Injected '{asset.Manifest.name}' (ID {asset.Id}).");
             }
             catch (Exception ex)
             {
@@ -213,6 +222,7 @@ public static class PaintManager
     public static Material GetOrCreateMaterial(PaintAsset asset, PlayerBodyMaterialController controller)
     {
         if (asset.Material != null) return asset.Material;
+        if (asset.IsEffect) return null; // Effects never create paint materials.
 
         Material baseMat = null;
         try
@@ -239,7 +249,7 @@ public static class PaintManager
 
         var mat = new Material(baseMat) { name = $"CustomPaint_{asset.Id}" };
 
-        // Force tint to white so we don't inherit TattooDark's dark color
+        // Force tint so we don't inherit TattooDark's dark color.
         var m = asset.Manifest;
         var tint = new Color(m.r / 255f, m.g / 255f, m.b / 255f, 1f);
         if (mat.HasProperty("_BaseColor")) mat.SetColor("_BaseColor", tint);
@@ -250,13 +260,13 @@ public static class PaintManager
             if (mat.HasProperty("_MainTex")) mat.SetTexture("_MainTex", asset.Texture);
             if (mat.HasProperty("_BaseMap")) mat.SetTexture("_BaseMap", asset.Texture);
 
-            // The shader is "TransClipping", meaning it cuts out transparency based on a threshold.
-            // We lower the threshold so the transparent background of the PNG vanishes completely.
+            // TransClipping shader cuts alpha; lower threshold so the transparent
+            // background of the PNG vanishes completely.
             if (mat.HasProperty("_Cutoff")) mat.SetFloat("_Cutoff", 0.01f);
         }
 
         asset.Material = mat;
-        Plugin.Log.LogInfo(
+        Plugin.Log.LogDebug(
             $"[Paint] Material '{mat.name}' from '{baseMat.name}' shader={mat.shader?.name}" +
             $" tex={(asset.Texture != null ? asset.Texture.name : "base")}");
         return mat;
@@ -290,8 +300,6 @@ public static class PaintManager
         }
     }
 
-    // ───────────────────────────── UI refresh (F5) ─────────────────────────────
-
     // ───────────────────────────── proxy activation ─────────────────────────────
 
     /// <summary>Set by the ApplyFromGameState prefix, consumed by the TransToMaterialAsset prefix.</summary>
@@ -304,7 +312,7 @@ public static class PaintManager
     /// </summary>
     internal const BodyPaintType ProxyType = BodyPaintType.TattooDark;
 
-    /// <summary>ID of the first active custom paint, or -1.</summary>
+    /// <summary>ID of the first active custom paint (effects excluded), or -1.</summary>
     public static int GetActiveCustomId()
     {
         try
@@ -313,6 +321,7 @@ public static class PaintManager
             if (dict == null) return -1;
             foreach (var a in Bank.Values)
             {
+                if (a.IsEffect) continue;
                 if (dict.TryGetValue((BodyPaintType)a.Id, out bool on) && on) return a.Id;
             }
         }
@@ -326,9 +335,8 @@ public static class PaintManager
     private const string OurMaterialPrefix = "CustomPaint_";
 
     /// <summary>
-    /// Acts as a cleanup safety net. Since the Proxy Method in PaintPatches.cs 
-    /// handles inserting the material natively, we only need this to ensure 
-    /// our custom materials are removed when the player turns the paint off.
+    /// Keeps the body's material list in sync with active custom paints.
+    /// Effects are handled separately by EffectManager — they are skipped here.
     /// </summary>
     internal static void SyncBodyPaint(PlayerBodyMaterialController controller)
     {
@@ -351,17 +359,18 @@ public static class PaintManager
             var dict = GameState.PlayerCustomData?.BodyPaintTypeDict;
             if (dict == null) return;
 
-            // Collect ALL active custom IDs
+            // Collect ALL active custom paints (effects excluded).
             var activeIds = new List<int>();
             foreach (var a in Bank.Values)
             {
+                if (a.IsEffect) continue;
                 if (dict.TryGetValue((BodyPaintType)a.Id, out bool on) && on)
                     activeIds.Add(a.Id);
             }
 
             var mats = _bodyRenderer.materials;
 
-            // Check if the current renderer already matches our desired state
+            // Already matches desired state?
             bool stateMatches = true;
             int currentCustomCount = 0;
             for (int i = 0; i < mats.Length; i++)
@@ -377,7 +386,7 @@ public static class PaintManager
             }
             if (currentCustomCount != activeIds.Count) stateMatches = false;
 
-            if (stateMatches) return; // Nothing to do, already perfect!
+            if (stateMatches) return;
 
             var list = new List<Material>(mats.Length + activeIds.Count);
             for (int i = 0; i < mats.Length; i++)
@@ -385,10 +394,10 @@ public static class PaintManager
                 var m = mats[i];
                 if (m == null) continue;
 
-                // Remove our old custom materials
+                // Drop our old custom paint materials.
                 if (m.name != null && m.name.StartsWith(OurMaterialPrefix)) continue;
 
-                // Remove the vanilla tattoos if we have custom paints replacing them
+                // Drop the vanilla proxy material so the custom one can take its slot.
                 if (activeIds.Count > 0)
                 {
                     bool isProxy = false;
@@ -406,7 +415,7 @@ public static class PaintManager
                 list.Add(m);
             }
 
-            // Find the sweat layer to insert before it
+            // Insert before the Sweat layer if present.
             int insertAt = list.Count;
             for (int i = 0; i < list.Count; i++)
             {
@@ -415,7 +424,6 @@ public static class PaintManager
                 { insertAt = i; break; }
             }
 
-            // Insert all active custom paints
             foreach (int id in activeIds)
             {
                 if (Bank.TryGetValue(id, out var asset))
@@ -425,141 +433,20 @@ public static class PaintManager
                     {
                         mat.name = OurMaterialPrefix + id;
                         list.Insert(insertAt, mat);
-                        insertAt++; // stack them next to each other
-                        Plugin.Log.LogInfo($"[Paint] Applied '{asset.Manifest.name}' (id {id}) to {BodyRendererName}");
+                        insertAt++;
                     }
                 }
             }
 
-            if (activeIds.Count == 0)
-                Plugin.Log.LogInfo($"[Paint] Removed all custom paints from {BodyRendererName}");
-
             _bodyRenderer.materials = list.ToArray();
+
+            // NEW: effects overlay paint — reapply now instead of waiting for the 0.5s verify tick
+            EffectManager.NotifyMaterialsChanged();
         }
         catch (Exception ex) { Plugin.Log.LogWarning($"[Paint] SyncBodyPaint: {ex.Message}"); }
     }
 
-    // ───────────────────────────── dev helpers ─────────────────────────────
-
-    public static void DumpPaintState(string tag)
-    {
-        try
-        {
-            var pcd = GameState.PlayerCustomData;
-            if (pcd == null) { Plugin.Log.LogInfo($"[PaintDbg] dict({tag}) = no PlayerCustomData"); return; }
-            var dict = pcd.BodyPaintTypeDict;
-            if (dict == null) { Plugin.Log.LogInfo($"[PaintDbg] dict({tag}) = NULL"); return; }
-
-            var sb = new System.Text.StringBuilder($"[PaintDbg] dict({tag}):");
-            foreach (var kvp in dict) sb.Append($" {(int)kvp.Key}={(kvp.Value ? 1 : 0)}");
-            Plugin.Log.LogInfo(sb.ToString());
-        }
-        catch (Exception ex) { Plugin.Log.LogWarning($"[Paint] DumpPaintState: {ex.Message}"); }
-    }
-
-    /// <summary>F6: reset only our custom paints to unpurchased and price 0 (dev/testing).</summary>
-    public static void DevFreeMode()
-    {
-        try
-        {
-            var dict = GameState.PlayerCustomData?.BodyPaintTypeDict;
-            foreach (var a in Bank.Values)
-            {
-                var type = (BodyPaintType)a.Id;
-                if (dict != null)
-                {
-                    if (dict.ContainsKey(type)) dict[type] = false;
-                    else dict.Add(type, false);
-                }
-                if (MBodyPaint.dict != null && MBodyPaint.dict.TryGetValue(type, out var rec))
-                    rec._Price_k__BackingField = 0;
-                a.Manifest.price = 0;
-                try { GameStateFacade.SetActiveBodyPaint(type, false); } catch { }
-            }
-
-            Plugin.Log.LogInfo($"[Paint] F6: {Bank.Count} custom paint(s) reset to unpurchased, price 0.");
-            DumpPaintState("after F6");
-            RefreshUi();
-        }
-        catch (Exception ex) { Plugin.Log.LogError($"[Paint] F6 failed: {ex}"); }
-    }
-
-    /// <summary>F7: dump every renderer under the player with materials + _MainTex names.</summary>
-    public static void DevDumpMaterials()
-    {
-        DumpBodyRenderers("F7");
-    }
-
-    /// <summary>F10: temporarily force a VANILLA paint on, dumping the body before/after so we
-    /// can see exactly which renderer/material slot the game paints into.</summary>
-    public static void DevForceVanilla()
-    {
-        try
-        {
-            var type = BodyPaintType.Inmon;
-            var dict = GameState.PlayerCustomData?.BodyPaintTypeDict;
-
-            Plugin.Log.LogInfo($"[Paint] F10: forcing vanilla {(int)type} active (was={(dict != null && dict.ContainsKey(type) ? dict[type].ToString() : "missing")})");
-            DumpBodyRenderers("F10-before");
-
-            GameStateFacade.SetActiveBodyPaint(type, true);
-            DumpPaintState("F10 after SetActive");
-
-            var ctrl = PlayerFacade.Instance != null ? PlayerFacade.Instance.pca?.PlayerBodyMaterialController : null;
-            Plugin.Log.LogInfo($"[Paint] F10 controller={(ctrl != null)}");
-            if (ctrl != null) ctrl.SetupBodyPaintFromGameState();
-
-            DumpBodyRenderers("F10-after");
-
-            // restore
-            GameStateFacade.SetActiveBodyPaint(type, false);
-            if (ctrl != null) ctrl.SetupBodyPaintFromGameState();
-            DumpBodyRenderers("F10-restored");
-        }
-        catch (Exception ex) { Plugin.Log.LogError($"[Paint] F10 failed: {ex}"); }
-    }
-
-    private static void DumpBodyRenderers(string tag)
-    {
-        try
-        {
-            var root = PlayerFacade.Instance?.GetTransform();
-            if (root == null) { Plugin.Log.LogInfo($"[Paint] {tag}: no player root"); return; }
-
-            foreach (var r in root.GetComponentsInChildren<Renderer>(true))
-            {
-                if (r == null) continue;
-
-                var sb = new System.Text.StringBuilder();
-                sb.Append($"[Paint] {tag} '{PathOf(r.transform, root)}' enabled={r.enabled} mats={r.sharedMaterials.Length}");
-
-                var mats = r.sharedMaterials;
-                for (int i = 0; i < mats.Length; i++)
-                {
-                    var m = mats[i];
-                    if (m == null) { sb.Append($" [{i}]=null"); continue; }
-                    var tex = m.HasProperty("_MainTex") ? m.GetTexture("_MainTex") : null;
-                    sb.Append($" [{i}]={m.name}(main={(tex != null ? tex.name : "-")})");
-                }
-
-                Plugin.Log.LogInfo(sb.ToString());
-            }
-        }
-        catch (Exception ex) { Plugin.Log.LogWarning($"[Paint] {tag} dump failed: {ex.Message}"); }
-    }
-
-    private static string PathOf(Transform t, Transform root)
-    {
-        var s = t.name;
-        var p = t.parent;
-        int guard = 0;
-        while (p != null && p != root && guard++ < 32)
-        {
-            s = p.name + "/" + s;
-            p = p.parent;
-        }
-        return s;
-    }
+    // ───────────────────────────── UI refresh ─────────────────────────────
 
     public static void RefreshUi()
     {
@@ -568,62 +455,10 @@ public static class PaintManager
             var inst = CustomizeMenuView.Instance;
             if (inst == null) return;
             AccessTools.Method(typeof(CustomizeMenuView), "RefreshPaintView")?.Invoke(inst, null);
-            Plugin.Log.LogInfo("[Paint] Paint tab refreshed.");
         }
         catch (Exception ex)
         {
             Plugin.Log.LogWarning($"[Paint] RefreshUi failed: {ex.Message}");
         }
-    }
-
-    /// <summary>F8: dump every vanilla body-paint material + its textures (body UV reference).</summary>
-    public static void DumpVanillaPaintTextures()
-    {
-        try
-        {
-            string dir = Path.Combine(Paths.BepInExRootPath, "bodypaint_textures");
-            Directory.CreateDirectory(dir);
-
-            var ar = AssetReferencer.Instance;
-            if (ar == null) { Plugin.Log.LogWarning("[Paint] F8: no AssetReferencer"); return; }
-
-            var mats = new (string Name, Material Mat)[]
-            {
-                ("SweatBody", ar.SweatBody), ("Inmon", ar.Inmon), ("Rakugaki", ar.Rakugaki),
-                ("TattooDark", ar.TattooDark), ("TattooFlower1", ar.TattooFlower1),
-                ("TattooFlower2", ar.TattooFlower2), ("TattooLotus", ar.TattooLotus),
-                ("TattooSatanism", ar.TattooSatanism), ("TattooSlave", ar.TattooSlave),
-                ("RubberSuit", ar.RubberSuit), ("ClothesPaint", ar.ClothesPaint),
-            };
-
-            int saved = 0;
-            foreach (var (name, mat) in mats)
-            {
-                if (mat == null) { Plugin.Log.LogInfo($"[Paint] F8 {name}: null"); continue; }
-                var sh = mat.shader;
-                if (sh == null) continue;
-
-                var props = new System.Text.StringBuilder();
-                int n = sh.GetPropertyCount();
-                for (int i = 0; i < n; i++)
-                {
-                    if (sh.GetPropertyType(i) != UnityEngine.Rendering.ShaderPropertyType.Texture) continue;
-                    string prop = sh.GetPropertyName(i);
-                    Texture t = null;
-                    try { t = mat.GetTexture(prop); } catch { }
-                    props.Append(' ').Append(prop).Append(t != null ? "*" : "-");
-                    if (t == null) continue;
-                    try
-                    {
-                        ReferenceExporter.SaveTexture(t, Path.Combine(dir, $"{name}_{prop.TrimStart('_')}.png"));
-                        saved++;
-                    }
-                    catch (Exception ex) { props.Append("!").Append(ex.Message); }
-                }
-                Plugin.Log.LogInfo($"[Paint] F8 {name}: shader={sh.name} tex:{props}");
-            }
-            Plugin.Log.LogInfo($"[Paint] F8 done: {saved} texture(s) -> {dir}");
-        }
-        catch (Exception ex) { Plugin.Log.LogError($"[Paint] F8 failed: {ex}"); }
     }
 }
